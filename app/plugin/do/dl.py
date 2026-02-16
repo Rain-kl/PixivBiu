@@ -47,6 +47,9 @@ class DoDownload(interRoot):
         if r["type"] != "illust" and r["type"] != "manga" and r["type"] != "ugoira":
             self.code = 0
             return "only support illustration, manga and ugoira"
+        if r["type"] == "ugoira":
+            logger.info("Skip ugoira by configless rule: artwork={}", str(r.get("id", "unknown")))
+            return "skipped_ugoira"
 
         is_single = len(r["meta_pages"]) == 0
         if self.__is_immich_mode() and r["type"] in ["illust", "manga"]:

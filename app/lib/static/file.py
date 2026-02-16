@@ -6,7 +6,6 @@ import time
 import zipfile
 
 import yaml
-from PIL import Image
 
 from altfe.interface.root import interRoot
 
@@ -153,6 +152,10 @@ class static_file(object):
 
     @staticmethod
     def cov2webp(uri, plist, dlist, quality=100):
+        try:
+            from PIL import Image
+        except Exception:
+            return False
         imgs = []
         try:
             for x in plist:
@@ -171,6 +174,10 @@ class static_file(object):
 
     @staticmethod
     def cov2gif(uri, plist, dlist):
+        try:
+            from PIL import Image
+        except Exception:
+            return False
         imgs = []
         try:
             for x in plist:

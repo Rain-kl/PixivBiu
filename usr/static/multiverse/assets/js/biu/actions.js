@@ -392,6 +392,9 @@ function doDownloadPic(kt, workID = "none", idx = -1) {
             if (rep['msg']['rst'] === 'running') {
                 let bakJS = maybeEncode($('#dl_' + workID).attr('href'));
                 downloadList[String(workID)] = ([bakJS, 0]);
+            } else if (rep['msg']['rst'] === 'skipped_ugoira') {
+                $('#art_' + workID + ' a:first').attr('class', 'image proer-done');
+                $('#dl_' + workID + ' d').html('已跳过动图');
             } else {
                 $('#art_' + workID + ' a:first').attr('class', 'image proer-error');
                 $('#dl_' + workID + ' d').html('错误, 点击重试');

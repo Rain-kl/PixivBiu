@@ -1,0 +1,17 @@
+.git
+.gitignore
+.github
+.idea
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+
+# local/runtime cache
+usr/cache
+
+# docs and misc
+docs

@@ -119,10 +119,10 @@ class CoreBiu(interRoot):
         # Check and set network config
         _ln(self.lang("network.hint_in_check"))
         if (
-            helper.check_network(
-                is_no_proxy=self.sets["sys"]["proxy"] == "no", is_silent=False
-            )
-            is False
+                helper.check_network(
+                    is_no_proxy=self.sets["sys"]["proxy"] == "no", is_silent=False
+                )
+                is False
         ):
             raise Exception(self.lang("login.fail_to_get_token_due_to_network"))
 
@@ -145,7 +145,7 @@ class CoreBiu(interRoot):
 
         # Determine refresh token
         access, userid = False, False
-        refresh = self.STATIC.file.ain(self.getENV("rootPath") + "usr/.token")
+        refresh = self._read_refresh_token()
         if not refresh:
             # Guide user to get the initial refresh token manually
             _ln(SPrint.green(self.lang("login.hint_token_only")))
@@ -165,10 +165,10 @@ class CoreBiu(interRoot):
         self.save_token()
 
     def __login_app_api(
-        self,
-        refresh_token: str,
-        access_token: str | None = None,
-        userid: str | None = None,
+            self,
+            refresh_token: str,
+            access_token: str | None = None,
+            userid: str | None = None,
     ):
         """
         app 模式登录。
@@ -239,7 +239,8 @@ class CoreBiu(interRoot):
             % (
                 self.api_route,
                 self.sets["biu"]["download"]["mode"],
-                "IMMICH" if str(self.sets["biu"]["download"].get("storageMode", "LOCAL")).upper() == "IMMICH" else "LOCAL",
+                "IMMICH" if str(
+                    self.sets["biu"]["download"].get("storageMode", "LOCAL")).upper() == "IMMICH" else "LOCAL",
                 (
                     self.proxy.replace("http://", "").replace("/", "")
                     if self.proxy
@@ -291,9 +292,25 @@ class CoreBiu(interRoot):
         token = refresh_token if refresh_token else self.api.refresh_token
         if token is None:
             return False
-        return self.STATIC.file.aout(
-            self.getENV("rootPath") + "usr/.token", token, dRename=False
+        token_file = self._token_file_path()
+        return self.STATIC.file.aout(token_file, token, dRename=False)
+
+    def _token_file_path(self):
+        token_file = (
+                os.environ.get("PIXIV_TOKEN_FILE")
+                or os.environ.get("BIU_PIXIV_TOKEN_FILE")
+                or (self.getENV("rootPath") + "usr/.token")
         )
+        token_file = str(token_file).strip()
+        if "{ROOTPATH}" in token_file:
+            token_file = token_file.replace("{ROOTPATH}", self.getENV("rootPath"))
+        return token_file
+
+    def _read_refresh_token(self):
+        token_env = os.environ.get("PIXIV_REFRESH_TOKEN")
+        if token_env and str(token_env).strip() != "":
+            return str(token_env).strip()
+        return self.STATIC.file.ain(self._token_file_path())
 
     def update_status(self, type_, key, c):
         """
