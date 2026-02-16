@@ -6,12 +6,15 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from altfe.interface.root import interRoot
+from cust.immich_store import ImmichStore
+from loguru import logger
 
 
 @interRoot.bind("api/biu/do/dl/", "PLUGIN")
 class DoDownload(interRoot):
     def __init__(self):
         self.code = 1
+        self._immich = None
 
     def run(self, cmd):
         try:
@@ -46,6 +49,8 @@ class DoDownload(interRoot):
             return "only support illustration, manga and ugoira"
 
         is_single = len(r["meta_pages"]) == 0
+        if self.__is_immich_mode() and r["type"] in ["illust", "manga"]:
+            return self.__dl_immich(r)
 
         root_uri = (
             self.CORE.biu.sets["biu"]["download"]["saveURI"]
@@ -106,6 +111,74 @@ class DoDownload(interRoot):
             return "running"
         else:
             return False
+
+    def __is_immich_mode(self):
+        mode = self.CORE.biu.sets["biu"]["download"].get("storageMode", "LOCAL")
+        return str(mode).upper() == "IMMICH"
+
+    def __get_immich(self):
+        if self._immich is None:
+            self._immich = ImmichStore(self.getENV("rootPath"), self.CORE.biu.sets)
+        return self._immich
+
+    def __dl_immich(self, r):
+        store = self.__get_immich()
+        if not store.configured():
+            self.code = 0
+            return "immich is not configured"
+        urls = (
+            [r["meta_single_page"]["original_image_url"]]
+            if len(r["meta_pages"]) == 0
+            else [x["image_urls"]["original"] for x in r["meta_pages"]]
+        )
+        total = len(urls)
+        if total <= 0:
+            self.code = 0
+            return False
+
+        folder = store.build_temp_folder(str(r["id"]))
+        status = []
+        for index in range(total):
+            image_url = urls[index]
+            suf = image_url.split(".")[-1]
+            sign = "-1" if total == 1 else (str(r["id"]) if (index + 1 == total) else "%not_last%")
+            name = f"{str(r['id'])}_{str(index + 1).zfill(len(str(total)))}.{suf}"
+            ctx = {
+                "pixivArtworkId": str(r["id"]),
+                "title": str(r.get("title", "")),
+                "authorId": str(r.get("user", {}).get("id", "")),
+                "authorName": str(r.get("user", {}).get("name", "")),
+                "pageIndex": int(index + 1),
+                "totalPages": int(total),
+                "sourceUrl": f"https://www.pixiv.net/artworks/{str(r['id'])}",
+                "tags": [
+                    str(x.get("name", ""))
+                    for x in r.get("tags", [])
+                    if type(x) is dict and x.get("name", None) is not None
+                ],
+            }
+            status.append(
+                {
+                    "url": image_url.replace("https://i.pximg.net", self.CORE.biu.pximgURL),
+                    "folder": folder,
+                    "name": name,
+                    "dlArgs": {
+                        "_headers": {"referer": "https://app-api.pixiv.net/", "user-agent": "PixivBiu Client"},
+                        "@requests": {"proxies": {"https": self.CORE.biu.proxy}},
+                        "@aria2": {
+                            "referer": "https://app-api.pixiv.net/",
+                            "user-agent": "PixivBiu Client",
+                            "all-proxy": self.CORE.biu.proxy,
+                        },
+                        "@others": {"groupSign": sign},
+                        "@immich": ctx,
+                    },
+                    "callback": [self.__callback_check, self.__callback_immich_upload],
+                }
+            )
+        if self.CORE.dl.add(str(r["id"]), status):
+            return "running"
+        return False
 
     def format_name(self, name, data):
         """
@@ -217,12 +290,29 @@ class DoDownload(interRoot):
         """
         if self.CORE.dl.modName == "aria2":
             return None
+        immich_ctx = this._dlArgs.get("@immich", None)
+
+        def _log_download_failed(extra_reason=""):
+            if immich_ctx is None:
+                return
+            artwork_id = immich_ctx.get("pixivArtworkId", "unknown")
+            page_index = immich_ctx.get("pageIndex", "unknown")
+            logger.error(
+                "Immich download failed: artwork={}, page={}, reason={}",
+                artwork_id,
+                page_index,
+                extra_reason if extra_reason else "download task failed",
+            )
+
         group_sign = this._dlArgs["@others"]["groupSign"]
         if group_sign == "%not_last%":
+            if this.status(self.CORE.dl.mod.CODE_BAD):
+                _log_download_failed()
             return True
         elif group_sign == "-1":
             if this.status(self.CORE.dl.mod.CODE_BAD):
                 self.STATIC.file.rm(this._dlSaveUri)
+                _log_download_failed()
         else:
             status_arr = ["running"]
             while "running" in status_arr:
@@ -231,6 +321,7 @@ class DoDownload(interRoot):
             if "failed" in status_arr:
                 this.status(self.CORE.dl.mod.CODE_BAD, True)
                 self.STATIC.file.clearDIR(this._dlSaveDir, nothing=True)
+                _log_download_failed("task group contains failed item")
         return True
 
     def __callback_deter(self, this):
@@ -289,6 +380,44 @@ class DoDownload(interRoot):
         else:
             self.STATIC.file.cov2webp(name + ".webp", pl, dl)
         return True
+
+    def __callback_immich_upload(self, this):
+        """
+        回调函数：将临时下载的图片上传到 Immich，上传成功后删除临时文件。
+        """
+        if not this.status(self.CORE.dl.mod.CODE_GOOD_SUCCESS):
+            return None
+        if not this._dlSaveUri or not os.path.exists(this._dlSaveUri):
+            return False
+        try:
+            ctx = this._dlArgs.get("@immich", {})
+            store = self.__get_immich()
+            rep = store.upload_with_retry(
+                file_path=this._dlSaveUri,
+                file_name=this._dlSaveName,
+                ctx=ctx,
+            )
+            asset_id = rep.get("id") or rep.get("assetId")
+            if not asset_id:
+                raise Exception(f"missing asset id in response: {rep}")
+            store.register_asset(ctx, str(asset_id))
+            return True
+        except Exception as e:
+            this.status(self.CORE.dl.mod.CODE_BAD, True)
+            artwork_id = this._dlArgs.get("@immich", {}).get("pixivArtworkId", "unknown")
+            try:
+                self.__get_immich().mark_failed(artwork_id)
+            except:
+                pass
+            logger.error("Immich upload failed: artwork={}, reason={}", artwork_id, str(e))
+            return False
+        finally:
+            self.STATIC.file.rm(this._dlSaveUri)
+            try:
+                if this._dlSaveDir and os.path.exists(this._dlSaveDir) and len(os.listdir(this._dlSaveDir)) == 0:
+                    os.rmdir(this._dlSaveDir)
+            except:
+                pass
 
     @staticmethod
     def pure_name(name, dest="_"):

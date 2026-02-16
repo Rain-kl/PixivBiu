@@ -54,6 +54,30 @@ biu.download.mode: "dl-single"
   # dl-single: 程序单线程下载
   # aria2: 使用 aria2 下载，如果启用此项，还需填写下方的 aria2Host、aria2Secret
 
+biu.download.storageMode: "LOCAL"
+  # 存储模式
+  # LOCAL: 下载到本地
+  # IMMICH: 下载后直传 Immich（本地仅保留临时文件）
+
+biu.download.immich.host: ""
+  # Immich 服务地址，如 https://immich.example.com
+
+biu.download.immich.apiKey: ""
+  # Immich API Key（Token）
+
+biu.download.immich.verifyTLS: true
+  # 是否校验证书
+  # true 为开启；false 为关闭
+
+biu.download.immich.basePath: "/api"
+  # Immich API 基础路径，默认 /api
+
+biu.download.immich.timeoutSec: 20
+  # Immich API 请求超时时间（秒）
+
+biu.download.immich.retryMax: 3
+  # Immich 上传失败最大重试次数
+
 biu.download.aria2Host: ""
   # aria2 RPC 监听地址，如 localhost:6800
   # 下载时 dir, out, all-proxy, max-tries, check-certificate 配置项会由程序决定

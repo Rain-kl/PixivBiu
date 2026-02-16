@@ -11,6 +11,7 @@ from pixivpy3 import *
 
 from altfe.interface.root import interRoot
 from app.v2.utils.sprint import SPrint
+from cust.immich_store import ImmichStore
 
 _ln = lambda val, header="PixivBiu": print(f"[{header}] " + val if header else val)
 
@@ -86,6 +87,15 @@ class CoreBiu(interRoot):
         size_cache = self.STATIC.file.get_dir_size_mib(cache_path)
         if size_cache > float(self.sets["biu"]["search"]["maxCacheSizeMiB"]):
             self.STATIC.file.clearDIR(cache_path)
+        # Immich 连接检测
+        storage_mode = str(self.sets["biu"]["download"].get("storageMode", "LOCAL")).upper()
+        if storage_mode == "IMMICH":
+            store = ImmichStore(self.getENV("rootPath"), self.sets)
+            ok, msg = store.check_connection()
+            if not ok:
+                _ln(SPrint.red(f"Immich check failed: {msg}"))
+                input(self.lang("common.press_to_exit"))
+                sys.exit(0)
 
     def __get_biu_info(self):
         """
@@ -225,10 +235,11 @@ class CoreBiu(interRoot):
         )
         print(
             self.lang("ready.hint_function_types"),
-            "%s, %s, Proxy@%s"
+            "%s, %s, %s, Proxy@%s"
             % (
                 self.api_route,
                 self.sets["biu"]["download"]["mode"],
+                "IMMICH" if str(self.sets["biu"]["download"].get("storageMode", "LOCAL")).upper() == "IMMICH" else "LOCAL",
                 (
                     self.proxy.replace("http://", "").replace("/", "")
                     if self.proxy

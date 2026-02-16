@@ -183,3 +183,5 @@ $RECYCLE.BIN/
 .idea/
 
 uv.lock
+
+.env

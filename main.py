@@ -19,6 +19,36 @@ app = Flask(
 )
 
 
+def load_dotenv_file(path):
+    """
+    Load .env key=value pairs into process env.
+    Existing OS env vars take precedence and will not be overwritten.
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line == "" or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "":
+                    continue
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                if key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        print(traceback.format_exc())
+
+
 # 路由
 @app.route("/")
 def home():
@@ -31,6 +61,9 @@ def api(path):
 
 
 if __name__ == "__main__":
+    # Load .env before config initialization. OS env > .env > config.yml > default.
+    load_dotenv_file(os.path.join(rootPath, ".env"))
+
     # Altfe 框架初始化
     classRoot.setENV("rootPath", rootPath)
     classRoot.setENV("rootPathFrozen", rootPathFrozen)
