@@ -179,3 +179,7 @@ $RECYCLE.BIN/
 
 .vscode/
 .venv/
+
+.idea/
+
+uv.lock
