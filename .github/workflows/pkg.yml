@@ -63,15 +63,18 @@ jobs:
           python-version: "3.12"
           architecture: ${{ matrix.pythonArch }}
 
-      - name: Install Requirements
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install Dependencies
         run: |
-          pip install -r ./requirements.txt
-          pip install pyinstaller
+          uv sync --no-install-project
+          uv pip install pyinstaller
       
       - name: Run py-pkger.py
         run: |
           cd ./.pkg/
-          python ./py-pkger.py auto
+          uv run --project .. python ./py-pkger.py auto
         
       - name: Compress to ZIP (win)
         if: ${{ contains(matrix.version, 'win') }}
