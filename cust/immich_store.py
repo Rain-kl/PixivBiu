@@ -1,6 +1,6 @@
 import hashlib
-import json
 import os
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -46,8 +46,7 @@ class ImmichClient:
         url = self.base_url + path
         kwargs.setdefault("timeout", self.config.timeout_sec)
         kwargs.setdefault("verify", self.config.verify_tls)
-        rep = self.session.request(method, url, **kwargs)
-        return rep
+        return self.session.request(method, url, **kwargs)
 
     def check_auth(self):
         rep = self._request("GET", "/users/me")
@@ -94,13 +93,26 @@ class ImmichClient:
             raise ImmichError(f"add assets to album failed ({rep.status_code}): {rep.text[:300]}")
         return rep.json()
 
-    def create_stack(self, asset_ids: list[str], primary_asset_id: str):
+    def create_stack(self, asset_ids: list[str]):
         if len(asset_ids) <= 1:
             return None
-        payload = {"assetIds": asset_ids, "primaryAssetId": primary_asset_id}
+        payload = {"assetIds": asset_ids}
         rep = self._request("POST", "/stacks", json=payload)
         if rep.status_code >= 400:
             raise ImmichError(f"create stack failed ({rep.status_code}): {rep.text[:300]}")
+        return rep.json()
+
+    def get_stack(self, stack_id: str):
+        rep = self._request("GET", f"/stacks/{stack_id}")
+        if rep.status_code >= 400:
+            raise ImmichError(f"get stack failed ({rep.status_code}): {rep.text[:300]}")
+        return rep.json()
+
+    def update_stack(self, id_: str, primary_asset_id: str):
+        payload = {"primaryAssetId": primary_asset_id}
+        rep = self._request("PUT", f"/stacks/{id_}", json=payload)
+        if rep.status_code >= 400:
+            raise ImmichError(f"update stack failed ({rep.status_code}): {rep.text[:300]}")
         return rep.json()
 
 
@@ -119,11 +131,17 @@ class ImmichStore:
         self.root_path = root_path
         self.client = ImmichClient(self.config)
         self._lock = threading.Lock()
-        self._works = {}
         self._album_cache = {}
+        self._works = {}
+
+        self.host_key = self._host_key()
+        self._db_uri = os.path.join(self.root_path, "usr/cache/immich_record.db")
+        self._tbl_art = f"artwork_upload_record_{self.host_key}"
+        self._tbl_img = f"artwork_image_record_{self.host_key}"
+        self._init_db()
+
         self._album_cache_uri = os.path.join(self.root_path, "usr/cache/immich_album_cache.json")
         self._load_album_cache()
-        logger.debug("ImmichStore initialized: host={}, base_path={}", self.config.host, self.config.base_path)
 
     def enabled(self):
         return self.storage_mode == "IMMICH"
@@ -157,52 +175,132 @@ class ImmichStore:
         os.makedirs(folder, exist_ok=True)
         return folder if folder.endswith("/") else folder + "/"
 
-    def register_asset(self, ctx: dict, asset_id: str):
-        if "pixivArtworkId" not in ctx or "totalPages" not in ctx or "pageIndex" not in ctx:
-            logger.error("register_asset skipped due to invalid ctx: {}", ctx)
-            return
+    def prepare_work(self, ctx: dict):
         artwork_id = str(ctx["pixivArtworkId"])
-        with self._lock:
-            work = self._ensure_work(ctx)
-            work["assets"][int(ctx["pageIndex"])] = str(asset_id)
-            if work["up_bar"] is not None:
-                work["up_bar"].update(1)
-            can_finalize = (
-                not work["finalized"]
-                and not work["failed"]
-                and len(work["assets"]) == work["expected"]
+        author_id = str(ctx.get("authorId", ""))
+        total = int(ctx.get("totalPages", 0))
+        now = int(time.time())
+        with self._db_conn() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {self._tbl_art}
+                (pixivArtworkId, authorId, immichStackId, totalImageCount, successCount, createdAt, updatedAt, status)
+                VALUES (?, ?, NULL, ?, 0, ?, ?, 'RUNNING')
+                ON CONFLICT(pixivArtworkId) DO UPDATE SET
+                  authorId=excluded.authorId,
+                  totalImageCount=excluded.totalImageCount,
+                  updatedAt=excluded.updatedAt,
+                  status='RUNNING'
+                """,
+                (artwork_id, author_id, total, now, now),
             )
-            if can_finalize:
-                work["finalized"] = True
-        if can_finalize:
-            self._finalize_work(artwork_id)
 
-    def mark_failed(self, artwork_id: str):
         with self._lock:
             work = self._works.setdefault(
-                str(artwork_id),
+                artwork_id,
                 {
-                    "expected": 0,
-                    "assets": {},
-                    "finalized": True,
-                    "failed": True,
-                    "ctx": {},
+                    "expected": total,
+                    "processed": set(),
+                    "new_assets": set(),
+                    "ctx": ctx,
+                    "finalized": False,
                     "up_bar": None,
                 },
             )
-            work["failed"] = True
-            self._close_progress_locked(work)
+            work["expected"] = total
+            work["ctx"] = ctx
+            if work["up_bar"] is None:
+                work["up_bar"] = tqdm(total=total, desc=f"[{artwork_id}] UP", dynamic_ncols=True, leave=True)
+
+    def should_skip_page(self, ctx: dict):
+        artwork_id = str(ctx["pixivArtworkId"])
+        page_index = int(ctx["pageIndex"])
+        row = self._fetchone(
+            f"SELECT downloadSuccess, immichAssetId FROM {self._tbl_img} WHERE pixivArtworkId=? AND pageIndex=?",
+            (artwork_id, page_index),
+        )
+        if row is None:
+            return False, None
+        if int(row[0]) == 1 and row[1]:
+            return True, str(row[1])
+        return False, None
+
+    def upsert_page_pending(self, ctx: dict, image_name: str):
+        artwork_id = str(ctx["pixivArtworkId"])
+        page_index = int(ctx["pageIndex"])
+        source_url = str(ctx.get("sourceUrl", ""))
+        now = int(time.time())
+        with self._db_conn() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {self._tbl_img}
+                (pixivArtworkId, pageIndex, imageName, downloadSuccess, immichAssetId, sourceUrl, createdAt, updatedAt)
+                VALUES (?, ?, ?, 0, NULL, ?, ?, ?)
+                ON CONFLICT(pixivArtworkId, pageIndex) DO UPDATE SET
+                  imageName=excluded.imageName,
+                  sourceUrl=excluded.sourceUrl,
+                  updatedAt=excluded.updatedAt
+                """,
+                (artwork_id, page_index, image_name, source_url, now, now),
+            )
+
+    def mark_page_skipped(self, ctx: dict, asset_id: str):
+        self._mark_processed(ctx, success=True, asset_id=asset_id, is_new_asset=False)
+
+    def mark_page_failed(self, ctx: dict):
+        artwork_id = str(ctx["pixivArtworkId"])
+        page_index = int(ctx["pageIndex"])
+        now = int(time.time())
+        with self._db_conn() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {self._tbl_img}
+                (pixivArtworkId, pageIndex, imageName, downloadSuccess, immichAssetId, sourceUrl, createdAt, updatedAt)
+                VALUES (?, ?, ?, 0, NULL, ?, ?, ?)
+                ON CONFLICT(pixivArtworkId, pageIndex) DO UPDATE SET
+                  downloadSuccess=0,
+                  updatedAt=excluded.updatedAt
+                """,
+                (
+                    artwork_id,
+                    page_index,
+                    str(ctx.get("imageName", "")),
+                    str(ctx.get("sourceUrl", "")),
+                    now,
+                    now,
+                ),
+            )
+        self._mark_processed(ctx, success=False)
+
+    def register_asset(self, ctx: dict, asset_id: str):
+        artwork_id = str(ctx["pixivArtworkId"])
+        page_index = int(ctx["pageIndex"])
+        image_name = str(ctx.get("imageName", ""))
+        source_url = str(ctx.get("sourceUrl", ""))
+        now = int(time.time())
+        with self._db_conn() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {self._tbl_img}
+                (pixivArtworkId, pageIndex, imageName, downloadSuccess, immichAssetId, sourceUrl, createdAt, updatedAt)
+                VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(pixivArtworkId, pageIndex) DO UPDATE SET
+                  imageName=excluded.imageName,
+                  downloadSuccess=1,
+                  immichAssetId=excluded.immichAssetId,
+                  sourceUrl=excluded.sourceUrl,
+                  updatedAt=excluded.updatedAt
+                """,
+                (artwork_id, page_index, image_name, str(asset_id), source_url, now, now),
+            )
+        self._mark_processed(ctx, success=True, asset_id=str(asset_id), is_new_asset=True)
 
     def upload_with_retry(self, file_path: str, file_name: str, ctx: dict):
         device_asset_id = f"pixiv-{ctx['pixivArtworkId']}-{ctx['pageIndex']}"
         err = None
         for idx in range(self.config.retry_max):
             try:
-                return self.client.upload_asset(
-                    file_path=file_path,
-                    filename=file_name,
-                    device_asset_id=device_asset_id,
-                )
+                return self.client.upload_asset(file_path=file_path, filename=file_name, device_asset_id=device_asset_id)
             except Exception as e:
                 err = e
                 logger.warning(
@@ -218,33 +316,249 @@ class ImmichStore:
                 time.sleep(min(2 * (idx + 1), 5))
         raise ImmichError(str(err))
 
-    def _finalize_work(self, artwork_id: str):
+    def finalize_if_no_pending(self, artwork_id: str):
         with self._lock:
             work = self._works.get(str(artwork_id))
-            if not work or work.get("failed"):
+            if not work:
                 return
-            ctx = work["ctx"]
-            assets = [work["assets"][x] for x in sorted(work["assets"])]
-            self._close_progress_locked(work)
+            if work["finalized"]:
+                return
+            if len(work["processed"]) >= int(work["expected"]):
+                work["finalized"] = True
+            else:
+                return
+        self._finalize_work(str(artwork_id))
 
-        if len(assets) > 1:
-            rep = self.client.create_stack(asset_ids=assets, primary_asset_id=assets[0])
-            logger.info(
-                "Stack created successfully: artwork={}, primary={}, assets={}, stack={}",
-                artwork_id,
-                assets[0],
-                len(assets),
-                rep.get("id") if type(rep) is dict else "unknown",
+    def _mark_processed(self, ctx: dict, success: bool, asset_id: str | None = None, is_new_asset: bool = False):
+        artwork_id = str(ctx["pixivArtworkId"])
+        page_index = int(ctx["pageIndex"])
+        should_finalize = False
+        with self._lock:
+            work = self._works.get(artwork_id)
+            if not work:
+                # tolerate callbacks after process restart
+                self.prepare_work(ctx)
+                work = self._works.get(artwork_id)
+            if page_index not in work["processed"]:
+                work["processed"].add(page_index)
+            if success and work["up_bar"] is not None:
+                # Progress means page is already available in Immich (new upload or skipped).
+                work["up_bar"].update(1)
+            if is_new_asset and asset_id:
+                work["new_assets"].add(str(asset_id))
+            if not work["finalized"] and len(work["processed"]) >= int(work["expected"]):
+                work["finalized"] = True
+                should_finalize = True
+        if should_finalize:
+            self._finalize_work(artwork_id)
+
+    def _finalize_work(self, artwork_id: str):
+        ctx = None
+        new_assets = []
+        with self._lock:
+            work = self._works.get(str(artwork_id))
+            if work:
+                ctx = work.get("ctx")
+                new_assets = list(work.get("new_assets", set()))
+                self._close_progress_locked(work)
+
+        all_assets = self._get_all_asset_ids(artwork_id)
+        self._refresh_artwork_success(artwork_id)
+        self._set_artwork_status(artwork_id, "FINISHED")
+
+        if not all_assets:
+            logger.info("Finalize skip stack: artwork={}, reason=no assets", artwork_id)
+            return
+
+        stack_id = self._get_stack_id(artwork_id)
+        if stack_id:
+            if new_assets:
+                try:
+                    new_stack_id = self._merge_into_existing_stack(stack_id, sorted(new_assets))
+                    if new_stack_id and new_stack_id != stack_id:
+                        self._set_stack_id(artwork_id, new_stack_id)
+                    logger.info(
+                        "Stack append success: artwork={}, stack_id={}, add_assets={}",
+                        artwork_id,
+                        new_stack_id if new_stack_id else stack_id,
+                        len(new_assets),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Stack append failed: artwork={}, stack_id={}, reason={}", artwork_id, stack_id, str(e)
+                    )
+            else:
+                logger.info("Stack exists and no new assets: artwork={}, stack_id={}", artwork_id, stack_id)
+        else:
+            if len(all_assets) > 1:
+                rep = self.client.create_stack(asset_ids=all_assets)
+                new_stack_id = None
+                if isinstance(rep, dict):
+                    new_stack_id = rep.get("id") or rep.get("stackId")
+                if new_stack_id:
+                    self._set_stack_id(artwork_id, str(new_stack_id))
+                logger.info(
+                    "Stack created: artwork={}, stack_id={}, assets={}",
+                    artwork_id,
+                    new_stack_id if new_stack_id else "unknown",
+                    len(all_assets),
+                )
+
+        if ctx is not None:
+            album_id, is_new = self._get_or_create_album(ctx.get("authorName", ""), ctx.get("authorId", ""), all_assets)
+            if album_id and all_assets and not is_new:
+                self.client.add_assets_to_album(album_id, all_assets)
+                logger.info(
+                    "Added assets to album: artwork={}, album_id={}, asset_count={}",
+                    artwork_id,
+                    album_id,
+                    len(all_assets),
+                )
+
+    def _merge_into_existing_stack(self, stack_id: str, new_assets: list[str]):
+        stack = self.client.get_stack(stack_id)
+        existing_assets = [str(x.get("id")) for x in stack.get("assets", []) if x.get("id")]
+        primary_asset_id = stack.get("primaryAssetId")
+        if not primary_asset_id and existing_assets:
+            primary_asset_id = existing_assets[0]
+
+        if not primary_asset_id:
+            merged = []
+            seen = set()
+            for x in existing_assets + new_assets:
+                if x and x not in seen:
+                    seen.add(x)
+                    merged.append(x)
+            if len(merged) <= 1:
+                return stack_id
+            rep = self.client.create_stack(asset_ids=merged)
+            if isinstance(rep, dict):
+                return str(rep.get("id") or rep.get("stackId") or stack_id)
+            return stack_id
+
+        unresolved = []
+        existing_set = set(existing_assets)
+        for asset_id in new_assets:
+            if asset_id in existing_set:
+                continue
+            try:
+                self.client.update_stack(id_=asset_id, primary_asset_id=str(primary_asset_id))
+            except Exception:
+                unresolved.append(asset_id)
+
+        if len(unresolved) == 0:
+            return stack_id
+
+        merged = []
+        seen = set()
+        for x in existing_assets + new_assets:
+            if x and x not in seen:
+                seen.add(x)
+                merged.append(x)
+        if len(merged) <= 1:
+            return stack_id
+
+        rep = self.client.create_stack(asset_ids=merged)
+        if isinstance(rep, dict):
+            return str(rep.get("id") or rep.get("stackId") or stack_id)
+        return stack_id
+
+    def _host_key(self):
+        host = (self.config.host or "").strip().rstrip("/")
+        token = self.config.api_key or ""
+        raw = f"{host}|{token}".encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()[:12]
+
+    def _init_db(self):
+        os.makedirs(os.path.dirname(self._db_uri), exist_ok=True)
+        with self._db_conn() as conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._tbl_art} (
+                    pixivArtworkId TEXT PRIMARY KEY,
+                    authorId TEXT,
+                    immichStackId TEXT,
+                    totalImageCount INTEGER NOT NULL DEFAULT 0,
+                    successCount INTEGER NOT NULL DEFAULT 0,
+                    createdAt INTEGER,
+                    updatedAt INTEGER,
+                    status TEXT
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._tbl_img} (
+                    pixivArtworkId TEXT NOT NULL,
+                    pageIndex INTEGER NOT NULL,
+                    imageName TEXT,
+                    downloadSuccess INTEGER NOT NULL DEFAULT 0,
+                    immichAssetId TEXT,
+                    sourceUrl TEXT,
+                    createdAt INTEGER,
+                    updatedAt INTEGER,
+                    PRIMARY KEY (pixivArtworkId, pageIndex)
+                )
+                """
+            )
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.host_key}_art_author ON {self._tbl_art}(authorId)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.host_key}_art_stack ON {self._tbl_art}(immichStackId)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.host_key}_img_art ON {self._tbl_img}(pixivArtworkId)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.host_key}_img_asset ON {self._tbl_img}(immichAssetId)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.host_key}_img_success ON {self._tbl_img}(downloadSuccess)")
+
+    def _db_conn(self):
+        conn = sqlite3.connect(self._db_uri, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _fetchone(self, sql: str, params: tuple):
+        with self._db_conn() as conn:
+            cur = conn.execute(sql, params)
+            return cur.fetchone()
+
+    def _get_all_asset_ids(self, artwork_id: str):
+        with self._db_conn() as conn:
+            cur = conn.execute(
+                f"SELECT immichAssetId FROM {self._tbl_img} WHERE pixivArtworkId=? AND immichAssetId IS NOT NULL AND immichAssetId != '' ORDER BY pageIndex ASC",
+                (str(artwork_id),),
+            )
+            return [str(x[0]) for x in cur.fetchall()]
+
+    def _refresh_artwork_success(self, artwork_id: str):
+        with self._db_conn() as conn:
+            cur = conn.execute(
+                f"SELECT COUNT(1) FROM {self._tbl_img} WHERE pixivArtworkId=? AND downloadSuccess=1 AND immichAssetId IS NOT NULL",
+                (str(artwork_id),),
+            )
+            success = int(cur.fetchone()[0])
+            conn.execute(
+                f"UPDATE {self._tbl_art} SET successCount=?, updatedAt=? WHERE pixivArtworkId=?",
+                (success, int(time.time()), str(artwork_id)),
             )
 
-        album_id, is_new = self._get_or_create_album(ctx["authorName"], ctx["authorId"], assets)
-        if album_id and assets and not is_new:
-            self.client.add_assets_to_album(album_id, assets)
-            logger.info(
-                "Added assets to album: artwork={}, album_id={}, asset_count={}",
-                artwork_id,
-                album_id,
-                len(assets),
+    def _set_artwork_status(self, artwork_id: str, status: str):
+        with self._db_conn() as conn:
+            conn.execute(
+                f"UPDATE {self._tbl_art} SET status=?, updatedAt=? WHERE pixivArtworkId=?",
+                (status, int(time.time()), str(artwork_id)),
+            )
+
+    def _get_stack_id(self, artwork_id: str):
+        row = self._fetchone(
+            f"SELECT immichStackId FROM {self._tbl_art} WHERE pixivArtworkId=?",
+            (str(artwork_id),),
+        )
+        if not row or not row[0]:
+            return None
+        return str(row[0])
+
+    def _set_stack_id(self, artwork_id: str, stack_id: str):
+        with self._db_conn() as conn:
+            conn.execute(
+                f"UPDATE {self._tbl_art} SET immichStackId=?, updatedAt=? WHERE pixivArtworkId=?",
+                (str(stack_id), int(time.time()), str(artwork_id)),
             )
 
     def _cache_key(self):
@@ -255,6 +569,8 @@ class ImmichStore:
         if not os.path.exists(self._album_cache_uri):
             return
         try:
+            import json
+
             with open(self._album_cache_uri, "r", encoding="utf-8") as f:
                 raw = json.load(f)
         except Exception:
@@ -264,6 +580,8 @@ class ImmichStore:
         self._album_cache = raw.get("author_to_album", {}) or {}
 
     def _save_album_cache(self):
+        import json
+
         os.makedirs(os.path.dirname(self._album_cache_uri), exist_ok=True)
         data = {"config": self._cache_key(), "author_to_album": self._album_cache}
         with open(self._album_cache_uri, "w", encoding="utf-8") as f:
@@ -307,30 +625,6 @@ class ImmichStore:
             len(init_assets),
         )
         return album_id, True
-
-    def _ensure_work(self, ctx: dict):
-        artwork_id = str(ctx["pixivArtworkId"])
-        work = self._works.setdefault(
-            artwork_id,
-            {
-                "expected": int(ctx["totalPages"]),
-                "assets": {},
-                "finalized": False,
-                "failed": False,
-                "ctx": ctx,
-                "up_bar": None,
-            },
-        )
-        if work["up_bar"] is None:
-            expected = int(work["expected"])
-            prefix = f"[{artwork_id}]"
-            work["up_bar"] = tqdm(
-                total=expected,
-                desc=f"{prefix} UP",
-                dynamic_ncols=True,
-                leave=True,
-            )
-        return work
 
     def _close_progress_locked(self, work: dict):
         bar = work.get("up_bar")

@@ -18,3 +18,9 @@ services:
       - "4001"
     env_file:
       - .env
+    volumes:
+      # Do not edit the next line. If you want to change the database storage location on your system, edit the value of DB_DATA_LOCATION in the .env file
+      - pixivbiu-usr:/app/usr
+
+volumes:
+  pixivbiu-usr:

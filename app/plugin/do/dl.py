@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,8 @@ class DoDownload(interRoot):
     def __init__(self):
         self.code = 1
         self._immich = None
+        self._immich_batch_lock = threading.Lock()
+        self._immich_batch_done = set()
 
     def run(self, cmd):
         try:
@@ -139,27 +142,46 @@ class DoDownload(interRoot):
             self.code = 0
             return False
 
+        base_ctx = {
+            "pixivArtworkId": str(r["id"]),
+            "title": str(r.get("title", "")),
+            "authorId": str(r.get("user", {}).get("id", "")),
+            "authorName": str(r.get("user", {}).get("name", "")),
+            "totalPages": int(total),
+            "sourceUrl": f"https://www.pixiv.net/artworks/{str(r['id'])}",
+            "tags": [
+                str(x.get("name", ""))
+                for x in r.get("tags", [])
+                if type(x) is dict and x.get("name", None) is not None
+            ],
+        }
+        store.prepare_work(base_ctx)
+
         folder = store.build_temp_folder(str(r["id"]))
         status = []
+        batch_items = []
         for index in range(total):
             image_url = urls[index]
             suf = image_url.split(".")[-1]
             sign = "-1" if total == 1 else (str(r["id"]) if (index + 1 == total) else "%not_last%")
             name = f"{str(r['id'])}_{str(index + 1).zfill(len(str(total)))}.{suf}"
             ctx = {
-                "pixivArtworkId": str(r["id"]),
-                "title": str(r.get("title", "")),
-                "authorId": str(r.get("user", {}).get("id", "")),
-                "authorName": str(r.get("user", {}).get("name", "")),
+                "pixivArtworkId": base_ctx["pixivArtworkId"],
+                "title": base_ctx["title"],
+                "authorId": base_ctx["authorId"],
+                "authorName": base_ctx["authorName"],
                 "pageIndex": int(index + 1),
-                "totalPages": int(total),
-                "sourceUrl": f"https://www.pixiv.net/artworks/{str(r['id'])}",
-                "tags": [
-                    str(x.get("name", ""))
-                    for x in r.get("tags", [])
-                    if type(x) is dict and x.get("name", None) is not None
-                ],
+                "totalPages": base_ctx["totalPages"],
+                "sourceUrl": base_ctx["sourceUrl"],
+                "tags": base_ctx["tags"],
+                "imageName": name,
             }
+            should_skip, old_asset_id = store.should_skip_page(ctx)
+            if should_skip and old_asset_id:
+                store.mark_page_skipped(ctx, old_asset_id)
+                continue
+            store.upsert_page_pending(ctx, name)
+            batch_items.append({"ctx": ctx, "folder": folder, "name": name})
             status.append(
                 {
                     "url": image_url.replace("https://i.pximg.net", self.CORE.biu.pximgURL),
@@ -176,9 +198,20 @@ class DoDownload(interRoot):
                         "@others": {"groupSign": sign},
                         "@immich": ctx,
                     },
-                    "callback": [self.__callback_check, self.__callback_immich_upload],
+                    "callback": [self.__callback_check],
                 }
             )
+        if len(status) > 0:
+            # Only the last scheduled task triggers the artwork-level upload/stack flow.
+            status[-1]["dlArgs"]["@immichBatch"] = {
+                "artworkId": str(r["id"]),
+                "items": batch_items,
+                "folder": folder,
+            }
+            status[-1]["callback"].append(self.__callback_immich_batch_upload)
+        if len(status) == 0:
+            store.finalize_if_no_pending(str(r["id"]))
+            return "running"
         if self.CORE.dl.add(str(r["id"]), status):
             return "running"
         return False
@@ -307,6 +340,12 @@ class DoDownload(interRoot):
                 extra_reason if extra_reason else "download task failed",
             )
 
+        if immich_ctx is not None:
+            if this.status(self.CORE.dl.mod.CODE_BAD):
+                _log_download_failed()
+                self.__get_immich().mark_page_failed(immich_ctx)
+            return True
+
         group_sign = this._dlArgs["@others"]["groupSign"]
         if group_sign == "%not_last%":
             if this.status(self.CORE.dl.mod.CODE_BAD):
@@ -409,18 +448,90 @@ class DoDownload(interRoot):
             this.status(self.CORE.dl.mod.CODE_BAD, True)
             artwork_id = this._dlArgs.get("@immich", {}).get("pixivArtworkId", "unknown")
             try:
-                self.__get_immich().mark_failed(artwork_id)
+                self.__get_immich().mark_page_failed(this._dlArgs.get("@immich", {}))
             except:
                 pass
             logger.error("Immich upload failed: artwork={}, reason={}", artwork_id, str(e))
             return False
         finally:
             self.STATIC.file.rm(this._dlSaveUri)
+
+    def __callback_immich_batch_upload(self, this):
+        """
+        回调函数：单作品下载全部完成后再批量上传，随后统一堆叠与相册归档。
+        """
+        batch = this._dlArgs.get("@immichBatch", None)
+        if batch is None:
+            return True
+
+        artwork_id = str(batch.get("artworkId", ""))
+        if artwork_id == "":
+            return True
+
+        with self._immich_batch_lock:
+            if artwork_id in self._immich_batch_done:
+                return True
+            self._immich_batch_done.add(artwork_id)
+
+        try:
+            # Wait until all tasks in this artwork group finish downloading.
+            status_arr = ["running"]
+            while "running" in status_arr or "waiting" in status_arr:
+                status_arr = self.CORE.dl.status(artwork_id)
+                time.sleep(0.3)
+
+            store = self.__get_immich()
+            items = batch.get("items", [])
+            for item in items:
+                ctx = item.get("ctx", {})
+                file_name = item.get("name", "")
+                file_folder = item.get("folder", "")
+                if file_name == "" or file_folder == "":
+                    continue
+                file_path = os.path.join(file_folder, file_name)
+                if not os.path.exists(file_path):
+                    logger.error(
+                        "Immich batch upload skip missing file: artwork={}, page={}, file={}",
+                        ctx.get("pixivArtworkId", "unknown"),
+                        ctx.get("pageIndex", "unknown"),
+                        file_path,
+                    )
+                    store.mark_page_failed(ctx)
+                    continue
+                try:
+                    rep = store.upload_with_retry(
+                        file_path=file_path,
+                        file_name=file_name,
+                        ctx=ctx,
+                    )
+                    asset_id = rep.get("id") or rep.get("assetId")
+                    if not asset_id:
+                        raise Exception(f"missing asset id in response: {rep}")
+                    store.register_asset(ctx, str(asset_id))
+                except Exception as e:
+                    logger.error(
+                        "Immich batch upload failed: artwork={}, page={}, reason={}",
+                        ctx.get("pixivArtworkId", "unknown"),
+                        ctx.get("pageIndex", "unknown"),
+                        str(e),
+                    )
+                    store.mark_page_failed(ctx)
+                finally:
+                    self.STATIC.file.rm(file_path)
+
+            store.finalize_if_no_pending(artwork_id)
+
+            # Cleanup artwork temp folder only after finalize.
+            folder = batch.get("folder", "")
             try:
-                if this._dlSaveDir and os.path.exists(this._dlSaveDir) and len(os.listdir(this._dlSaveDir)) == 0:
-                    os.rmdir(this._dlSaveDir)
-            except:
+                if folder and os.path.exists(folder):
+                    self.STATIC.file.clearDIR(folder, nothing=True)
+            except Exception:
                 pass
+            return True
+        except Exception as e:
+            logger.error("Immich batch finalize failed: artwork={}, reason={}", artwork_id, str(e))
+            return False
 
     @staticmethod
     def pure_name(name, dest="_"):

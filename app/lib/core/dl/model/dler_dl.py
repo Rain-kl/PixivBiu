@@ -6,6 +6,7 @@ import requests
 
 from altfe.interface.root import interRoot
 from app.lib.core.dl.model.dler import Dler
+from loguru import logger
 
 requests.packages.urllib3.disable_warnings()
 
@@ -35,6 +36,14 @@ class DlDler(Dler):
         # 判断是否超过最大尝试次数
         if self._dlFileSize == -1 or self._dlRetryNum > self._dlRetryMax:
             self.status(Dler.CODE_BAD_FAILED, True)
+            logger.error(
+                "Download init failed: url={}, save={}, file_size={}, retry={}/{}",
+                self._dlUrl,
+                self._dlSaveUri,
+                self._dlFileSize,
+                self._dlRetryNum,
+                self._dlRetryMax,
+            )
             return False
 
         # 开始下载
@@ -69,7 +78,23 @@ class DlDler(Dler):
                 self._dlRetryNum += self._dlRetryMax
             else:
                 self._dlRetryNum += 1
+            logger.warning(
+                "Download merge failed, retrying: url={}, save={}, retry={}/{}",
+                self._dlUrl,
+                self._dlSaveUri,
+                self._dlRetryNum,
+                self._dlRetryMax,
+            )
             self.callback()
+            if self._dlRetryNum <= self._dlRetryMax:
+                wait_sec = min(2 * self._dlRetryNum, 10)
+                logger.warning(
+                    "Waiting before retry: url={}, save={}, wait={}s",
+                    self._dlUrl,
+                    self._dlSaveUri,
+                    wait_sec,
+                )
+                time.sleep(wait_sec)
             self.run()
 
     def clear_cache(self, isAllCache=False):
@@ -98,6 +123,13 @@ class DlDler(Dler):
                 cacheUri, begin, end = self._dlCacheBlockArr[i]
                 # 判断分块文件大小是否正确
                 if os.path.getsize(cacheUri) != (end - begin + 1):
+                    logger.error(
+                        "Block size mismatch: url={}, cache={}, expected={}, actual={}",
+                        self._dlUrl,
+                        cacheUri,
+                        (end - begin + 1),
+                        os.path.getsize(cacheUri),
+                    )
                     isDone = False
                     break
                 # 写入数据
@@ -132,6 +164,16 @@ class DlDler(Dler):
                 headers.update(self._dlArgs["_headers"])
 
                 rep = requests.get(self._dlUrl, headers=headers, **self._dlArgs["@requests"], stream=True)
+                if rep.status_code >= 400:
+                    logger.error(
+                        "Block download HTTP error: url={}, status={}, range={}-{}, cache={}",
+                        self._dlUrl,
+                        rep.status_code,
+                        existFileSize + int(begin),
+                        end,
+                        cacheUri,
+                    )
+                    return False
                 with open(cacheUri, "ab", buffering=1024) as f:
                     for chunk in rep.iter_content(chunk_size=2048):
                         # 若 CODE_BAD，则退出
@@ -145,7 +187,16 @@ class DlDler(Dler):
                         while self.status(Dler.CODE_WAIT):
                             time.sleep(1)
             return True
-        except:
+        except Exception as e:
+            logger.error(
+                "Block download exception: url={}, cache={}, range={}-{}, index={}, reason={}",
+                self._dlUrl,
+                cacheUri,
+                begin,
+                end,
+                index,
+                str(e),
+            )
             return False
 
     def __thread_monitor_schedule(self):
