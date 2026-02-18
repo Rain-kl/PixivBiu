@@ -37,6 +37,26 @@ PixivBiu，一款不错的 Pixiv **辅助**工具。
 
 - [Docker_Buildx_PixivBiu](https://github.com/zzcabc/Docker_Buildx_PixivBiu) by [zzcabc](https://github.com/zzcabc)
 
+### 收藏定时同步（Cron）
+
+可通过环境变量开启“按 Cron 定时下载全部收藏”：
+
+- `BIU_SYNC_BOOKMARKS_CRON`：5 段式 Cron 表达式（不配置则不启动定时任务）
+- `BIU_SYNC_WEBHOOK_URL`：任务完成后接收 POST 通知的 webhook 地址
+
+Webhook 请求体格式：
+
+```json
+{
+  "title": "title",
+  "description": "description",
+  "content": "content",
+  "url": "url"
+}
+```
+
+`content` 包含：当前总作品数、新增同步作品数、同步失败数、成功数（成功/失败为图片维度）。
+
 ## 贡献维护
 
 如果你想参与此项目的开发，欢迎查看[开发文档](https://biu.tls.moe/#/develop/quickin)。

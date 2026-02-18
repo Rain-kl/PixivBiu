@@ -72,6 +72,12 @@ if __name__ == "__main__":
     # 加载配置项
     SETS = classRoot.osGet("LIB_INS", "conf").dict("biu_default")
 
+    # 启动收藏定时同步任务（可选，未配置 cron 则不启用）
+    try:
+        classRoot.COMMON.bookmarkSync().start()
+    except Exception:
+        print(traceback.format_exc())
+
     # 调整日志等级
     if not SETS["sys"]["debug"]:
         cli = sys.modules["flask.cli"]
