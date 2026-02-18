@@ -7,6 +7,7 @@ from datetime import datetime
 import requests
 from altfe.interface.root import classRoot, interRoot
 from loguru import logger
+from tqdm import tqdm
 
 
 class CronMatcher:
@@ -108,13 +109,19 @@ class BookmarkSync(interRoot):
             key = now.strftime("%Y-%m-%d %H:%M")
             if key != self._last_hit_minute and self._matcher.matches(now):
                 self._last_hit_minute = key
-                self.run_now(async_mode=False)
+                self.run_now(async_mode=False, trigger="cron")
             time.sleep(5)
 
-    def run_now(self, async_mode=True):
+    def run_now(self, async_mode=True, trigger="manual"):
         if not self._run_lock.acquire(blocking=False):
             logger.warning("Bookmark sync job skipped because previous run is still in progress.")
             return False
+        logger.info(
+            "Bookmark sync job started. trigger={}, async={}, at={}",
+            trigger,
+            async_mode,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
         if async_mode:
             threading.Thread(target=self._run_once_locked, daemon=True).start()
             return True
@@ -144,11 +151,14 @@ class BookmarkSync(interRoot):
         success_images = 0
         failed_images = 0
         scheduled = {}
+        already_synced_artworks = 0
 
         dl_cls = classRoot.osGet("PLUGIN", "api/biu/do/dl/")
         if dl_cls is None:
             raise RuntimeError("download plugin not found: api/biu/do/dl/")
         downloader = dl_cls()
+
+        logger.info("Bookmark sync total favorites fetched: {}", total_artworks)
 
         for artwork in all_marks:
             artwork_id = str(artwork.get("id", ""))
@@ -174,13 +184,25 @@ class BookmarkSync(interRoot):
             task_states = self.CORE.dl.status(artwork_id)
             if len(task_states) == 0:
                 # IMMICH mode and all pages already synced.
+                already_synced_artworks += 1
                 continue
 
             scheduled[artwork_id] = len(task_states)
             new_synced_artworks += 1
+            logger.info(
+                "Incremental artwork scheduled for upload. artwork_id={}, image_tasks={}",
+                artwork_id,
+                len(task_states),
+            )
+
+        logger.info(
+            "Bookmark sync need-to-sync artworks: {} (already_synced={})",
+            new_synced_artworks,
+            already_synced_artworks,
+        )
 
         if len(scheduled) > 0:
-            self._wait_all_finished(list(scheduled.keys()))
+            self._wait_all_finished_with_progress(list(scheduled.keys()))
 
         for artwork_id, task_count in scheduled.items():
             states = self.CORE.dl.status(artwork_id)
@@ -212,16 +234,30 @@ class BookmarkSync(interRoot):
             failed_images,
         )
 
-    def _wait_all_finished(self, artwork_ids):
+    def _wait_all_finished_with_progress(self, artwork_ids):
+        progress = tqdm(total=len(artwork_ids), desc="[BookmarkSync] artworks", dynamic_ncols=True, leave=True)
+        done = set()
         deadline = time.time() + 6 * 60 * 60
         while True:
             all_done = True
             for artwork_id in artwork_ids:
+                if artwork_id in done:
+                    continue
                 states = self.CORE.dl.status(artwork_id)
                 if any(x in ("running", "waiting", "unknown") for x in states):
                     all_done = False
-                    break
+                    continue
+                done.add(artwork_id)
+                progress.update(1)
+                logger.info("Artwork sync finished. artwork_id={}, progress={}/{}", artwork_id, len(done), len(artwork_ids))
             if all_done or time.time() > deadline:
+                if time.time() > deadline and len(done) < len(artwork_ids):
+                    logger.warning(
+                        "Bookmark sync wait timeout. finished={}/{}",
+                        len(done),
+                        len(artwork_ids),
+                    )
+                progress.close()
                 return
             time.sleep(2)
 
@@ -263,6 +299,13 @@ class BookmarkSync(interRoot):
             "content": content,
             "url": url,
         }
+        logger.info(
+            "Webhook request sending. endpoint={}, timeout={}s, title={}, content_length={}",
+            self.webhook_url,
+            self.webhook_timeout_sec,
+            title,
+            len(content),
+        )
         try:
             rep = requests.post(
                 self.webhook_url,
@@ -272,6 +315,7 @@ class BookmarkSync(interRoot):
             if rep.status_code >= 400:
                 logger.warning("Webhook failed: status={}, body={}", rep.status_code, rep.text[:200])
                 return False
+            logger.info("Webhook success: status={}, body={}", rep.status_code, rep.text[:200])
             return True
         except Exception as e:
             logger.warning("Webhook request error: {}", str(e))
