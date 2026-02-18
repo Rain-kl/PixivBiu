@@ -88,6 +88,7 @@ class BookmarkSync(interRoot):
         self._last_hit_minute = None
 
     def start(self):
+        classRoot.setENV("bookmarkSyncInstance", self)
         if self.cron_expr == "":
             logger.info("Bookmark sync scheduler disabled (BIU_SYNC_BOOKMARKS_CRON not set).")
             return False
@@ -107,19 +108,34 @@ class BookmarkSync(interRoot):
             key = now.strftime("%Y-%m-%d %H:%M")
             if key != self._last_hit_minute and self._matcher.matches(now):
                 self._last_hit_minute = key
-                self._run_once_guarded()
+                self.run_now(async_mode=False)
             time.sleep(5)
 
-    def _run_once_guarded(self):
+    def run_now(self, async_mode=True):
         if not self._run_lock.acquire(blocking=False):
             logger.warning("Bookmark sync job skipped because previous run is still in progress.")
-            return
+            return False
+        if async_mode:
+            threading.Thread(target=self._run_once_locked, daemon=True).start()
+            return True
+        self._run_once_locked()
+        return True
+
+    def _run_once_locked(self):
         try:
             self._run_once()
         except Exception as e:
             logger.exception("Bookmark sync run failed: {}", str(e))
         finally:
             self._run_lock.release()
+
+    def _run_once_guarded(self):
+        # Keep compatibility for older calls.
+        if not self._run_lock.acquire(blocking=False):
+            logger.warning("Bookmark sync job skipped because previous run is still in progress.")
+            return False
+        self._run_once_locked()
+        return True
 
     def _run_once(self):
         all_marks = self._fetch_all_bookmarks()

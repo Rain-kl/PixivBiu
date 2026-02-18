@@ -443,6 +443,34 @@ function doUpdateToken() {
     });
 }
 
+function doBookmarkSyncNow() {
+    const el = $("#btnSyncBookmarksNow");
+    el.tooltipster("content", "同步任务启动中...");
+    el.prop("disabled", true);
+    $.ajax({
+        type: "POST",
+        url: "api/biu/do/bookmark_sync_now/",
+        data: { pass: "on" },
+        success: rep => {
+            rep = jQuery.parseJSON(JSON.stringify(rep));
+            if (rep.code === 1) {
+                el.tooltipster("content", "已启动，正在后台同步");
+            } else {
+                el.tooltipster("content", rep.msg === "already running" ? "已有同步任务正在运行" : "启动失败");
+            }
+        },
+        error: err => {
+            console.log(err);
+            el.tooltipster("content", "启动失败");
+        },
+        complete: () => {
+            setTimeout(() => {
+                el.prop("disabled", false);
+            }, 800);
+        }
+    });
+}
+
 function grpActChon(type, grpIdx = -1, args = null) {
     if (args === null) {
         if (!tmpPageData || !tmpPageData['args']) return;
