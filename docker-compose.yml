@@ -1,17 +1,14 @@
 services:
 
   anubis:
-    image: ghcr.io/rain-kl/anubis:latest
+    image: ghcr.io/rain-kl/anubis:v1.24.99.2
     ports:
       - "34001:8923"
     env_file:
       - .env
 
   pixivbiu:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: pixivbiu:alpine
+    image: ghcr.io/rain-kl/pixivbiu:feat
     container_name: pixivbiu
     restart: unless-stopped
     ports:
