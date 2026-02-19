@@ -1,23 +1,9 @@
 name: 📦 Package
 
 on:
-  # Triggers the workflow on push or pull request events but only for the master branch
-  # push:
-  #   branches: [ master ]
-  # pull_request:
-  #   branches: [ master ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
-    inputs:
-      releaseTag:
-        description: "Release Tag"
-        required: true
-        default: "v2.x.x[a-z]"
-      releaseName:
-        description: "Release Name"
-        required: true
-        default: "2.x.x"
+  push:
+    tags: ["v*"]
 
 jobs:
   build-on-platform:
@@ -44,6 +30,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
 
       - name: Classify files, prepare to be packaged
         run: |
@@ -101,6 +90,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: Resolve release version
+        run: |
+          echo "RELEASE_TAG=$(git describe --tags)" >> "$GITHUB_ENV"
       
       - name: Download from Artifact
         uses: actions/download-artifact@v4
@@ -110,16 +106,16 @@ jobs:
       
       - name: Rename
         run: |
-          mv ./win_x64.zip ./PixivBiu_${{ github.event.inputs.releaseTag }}_win_x64.zip
-          mv ./win_x86.zip ./PixivBiu_${{ github.event.inputs.releaseTag }}_win_x86.zip
-          mv ./mac_apple.zip ./PixivBiu_${{ github.event.inputs.releaseTag }}_mac_apple.zip
-          mv ./mac_intel.zip ./PixivBiu_${{ github.event.inputs.releaseTag }}_mac_intel.zip
-          mv ./ubuntu_x64.zip ./PixivBiu_${{ github.event.inputs.releaseTag }}_ubuntu_x64.zip
+          mv ./win_x64.zip ./PixivBiu_${{ env.RELEASE_TAG }}_win_x64.zip
+          mv ./win_x86.zip ./PixivBiu_${{ env.RELEASE_TAG }}_win_x86.zip
+          mv ./mac_apple.zip ./PixivBiu_${{ env.RELEASE_TAG }}_mac_apple.zip
+          mv ./mac_intel.zip ./PixivBiu_${{ env.RELEASE_TAG }}_mac_intel.zip
+          mv ./ubuntu_x64.zip ./PixivBiu_${{ env.RELEASE_TAG }}_ubuntu_x64.zip
         
       - name: Release and Done
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "PixivBiu_${{ github.event.inputs.releaseTag }}_win_x64.zip, PixivBiu_${{ github.event.inputs.releaseTag }}_win_x86.zip, PixivBiu_${{ github.event.inputs.releaseTag }}_mac_apple.zip, PixivBiu_${{ github.event.inputs.releaseTag }}_mac_intel.zip, PixivBiu_${{ github.event.inputs.releaseTag }}_ubuntu_x64.zip"
-          tag: ${{ github.event.inputs.releaseTag }}
-          name: ${{ github.event.inputs.releaseName }}
+          artifacts: "PixivBiu_${{ env.RELEASE_TAG }}_win_x64.zip, PixivBiu_${{ env.RELEASE_TAG }}_win_x86.zip, PixivBiu_${{ env.RELEASE_TAG }}_mac_apple.zip, PixivBiu_${{ env.RELEASE_TAG }}_mac_intel.zip, PixivBiu_${{ env.RELEASE_TAG }}_ubuntu_x64.zip"
+          tag: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
           token: ${{ secrets.GITHUB_TOKEN }}

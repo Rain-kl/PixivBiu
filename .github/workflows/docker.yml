@@ -3,11 +3,7 @@ name: Docker image builds
 on:
     workflow_dispatch:
     push:
-        branches: ["main"]
         tags: ["v*"]
-
-env:
-    DOCKER_METADATA_SET_OUTPUT_ENV: "true"
 
 permissions:
     contents: read
@@ -29,6 +25,7 @@ jobs:
             - name: Set lowercase image name
               run: |
                   echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+                  echo "VERSION=$(git describe --tags)" >> $GITHUB_ENV
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
@@ -40,19 +37,6 @@ jobs:
                   username: ${{ github.repository_owner }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Docker meta
-              id: meta
-              uses: docker/metadata-action@v5
-              with:
-                  images: ${{ env.IMAGE }}
-                  tags: |
-                      type=ref,event=branch
-                      type=ref,event=pr
-                      type=semver,pattern={{version}}
-                      type=semver,pattern={{major}}.{{minor}}
-                      type=semver,pattern={{major}}
-                      type=sha
-
             - name: Build and push
               id: build
               uses: docker/build-push-action@v6
@@ -60,8 +44,7 @@ jobs:
                   context: .
                   file: ./Dockerfile
                   push: true
-                  tags: ${{ steps.meta.outputs.tags }}
-                  labels: ${{ steps.meta.outputs.labels }}
+                  tags: ${{ env.IMAGE }}:${{ env.VERSION }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
                   platforms: linux/amd64,linux/arm64

@@ -74,13 +74,19 @@ class CronMatcher:
 
 @interRoot.bind("bookmarkSync", "LIB_COMMON")
 class BookmarkSync(interRoot):
+    @staticmethod
+    def _read_env_str(name: str, default: str = ""):
+        val = str(os.environ.get(name, default) or default).strip()
+        # docker compose env_file may keep wrapping quotes, e.g. "\"30 3 * * *\""
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1].strip()
+        return val
+
     def __init__(self):
-        self.cron_expr = str(os.environ.get("BIU_SYNC_BOOKMARKS_CRON", "") or "").strip()
-        self.webhook_url = str(os.environ.get("BIU_SYNC_WEBHOOK_URL", "") or "").strip()
-        self.webhook_title = str(
-            os.environ.get("BIU_SYNC_WEBHOOK_TITLE", "PixivBiu 收藏定时同步结果") or "PixivBiu 收藏定时同步结果"
-        ).strip()
-        self.webhook_content_url = str(os.environ.get("BIU_SYNC_WEBHOOK_CONTENT_URL", "") or "").strip()
+        self.cron_expr = self._read_env_str("BIU_SYNC_BOOKMARKS_CRON", "")
+        self.webhook_url = self._read_env_str("BIU_SYNC_WEBHOOK_URL", "")
+        self.webhook_title = self._read_env_str("BIU_SYNC_WEBHOOK_TITLE", "PixivBiu 收藏定时同步结果")
+        self.webhook_content_url = self._read_env_str("BIU_SYNC_WEBHOOK_CONTENT_URL", "")
         self.webhook_timeout_sec = max(3, int(os.environ.get("BIU_SYNC_WEBHOOK_TIMEOUT_SEC", "10")))
 
         self._matcher = None
@@ -100,7 +106,11 @@ class BookmarkSync(interRoot):
             return False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        logger.info("Bookmark sync scheduler started. cron='{}'", self.cron_expr)
+        logger.info(
+            "Bookmark sync scheduler started. cron='{}', now='{}'",
+            self.cron_expr,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
         return True
 
     def _loop(self):
