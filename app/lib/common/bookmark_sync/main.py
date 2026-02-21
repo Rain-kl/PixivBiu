@@ -161,6 +161,7 @@ class BookmarkSync(interRoot):
         success_images = 0
         failed_images = 0
         scheduled = {}
+        scheduled_artworks = 0
         already_synced_artworks = 0
 
         dl_cls = classRoot.osGet("PLUGIN", "api/biu/do/dl/")
@@ -198,7 +199,7 @@ class BookmarkSync(interRoot):
                 continue
 
             scheduled[artwork_id] = len(task_states)
-            new_synced_artworks += 1
+            scheduled_artworks += 1
             logger.info(
                 "Incremental artwork scheduled for upload. artwork_id={}, image_tasks={}",
                 artwork_id,
@@ -207,7 +208,7 @@ class BookmarkSync(interRoot):
 
         logger.info(
             "Bookmark sync need-to-sync artworks: {} (already_synced={})",
-            new_synced_artworks,
+            scheduled_artworks,
             already_synced_artworks,
         )
 
@@ -222,6 +223,14 @@ class BookmarkSync(interRoot):
             done = states.count("done")
             failed = states.count("failed")
             other = max(0, len(states) - done - failed)
+            if done > 0:
+                new_synced_artworks += 1
+            else:
+                logger.warning(
+                    "Artwork sync finished with zero success images. artwork_id={}, states={}",
+                    artwork_id,
+                    states,
+                )
             success_images += done
             failed_images += (failed + other)
 
